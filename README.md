@@ -49,6 +49,19 @@ make logs
 make stop
 ```
 
+### 5. Check Server Status
+Verify that the container is running or hit the `/health` endpoint to ensure the model is ready:
+```bash
+make status  # Shows container status
+make check   # Tests the /health endpoint
+```
+
+### 6. Update the Server
+Easily fetch the latest `llama.cpp` image without disrupting an active session:
+```bash
+make pull
+```
+
 ---
 
 ## ⚙️ Tuning & Configuration
@@ -63,6 +76,8 @@ N_GPU_LAYERS=24 THREADS=4 make run model.gguf
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
+| `ENGINE` | `podman` | The container runtime engine (e.g., `podman` or `docker`). |
+| `DEVICES`| `--device /dev/kfd --device /dev/dri` | Hardware acceleration arguments. |
 | `PORT` | `8080` | The port exposed to your host machine. |
 | `N_GPU_LAYERS` | `99` | Number of layers to offload to the GPU. Keep at 99 for full offload, or lower it if you face VRAM pressure. |
 | `N_CTX` | `4096` | Context window size. Increase for larger document processing (requires more RAM/VRAM). |
@@ -70,17 +85,23 @@ N_GPU_LAYERS=24 THREADS=4 make run model.gguf
 | `ENABLE_FILE_LOGGING`| `false` | Set to `true` to pipe server output to a text file. |
 | `LOG_DIR` | `$(CURDIR)/llama-logs` | The directory where log files are stored. |
 | `MODELS_DIR` | `$(CURDIR)`| The directory where models are downloaded and read from. |
-| `CONTAINER_NAME`| `llama-server`| Name of the Podman container. |
+| `CONTAINER_NAME`| `llama-server`| Name of the container. |
 
 ---
 
 ## 🛠️ Switching to NVIDIA (CUDA)
-If you want to run this on an NVIDIA GPU, simply edit the `IMAGE` variable in the `Makefile`:
+If you want to run this on an NVIDIA GPU, simply override the `IMAGE` and `DEVICES` variables (and `ENGINE` if using Docker):
 
+```bash
+ENGINE=docker DEVICES="--gpus all" IMAGE=ghcr.io/ggml-org/llama.cpp:server-cuda make run model.gguf
+```
+
+Or change them permanently inside the `Makefile`:
 ```makefile
+ENGINE ?= docker
+DEVICES ?= --gpus all
 IMAGE ?= ghcr.io/ggml-org/llama.cpp:server-cuda
 ```
-*Note: You may also need to change the podman device mounts (`--device /dev/kfd --device /dev/dri`) to the appropriate NVIDIA flags (e.g., `--gpus all` or using the nvidia-container-toolkit).*
 
 ---
 
