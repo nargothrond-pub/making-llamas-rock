@@ -14,17 +14,16 @@ ENGINE        ?= podman
 DEVICES       ?= --device /dev/kfd --device /dev/dri
 
 # --- GPU auto-detection -------------------------------------------------------
-# Detect the AMD GPU gfx target from the host using rocm-smi, rocminfo, or
-# sysfs (in that priority order), then map it to the RDNA family and set the
-# HSA_OVERRIDE_GFX_VERSION that ROCm needs for unsupported consumer GPUs.
+# Detect the AMD GPU gfx target from the host using rocm-smi or rocminfo,
+# then map it to the RDNA family and set the HSA_OVERRIDE_GFX_VERSION that
+# ROCm needs for unsupported consumer GPUs.
 #
 # Override at any time:  make run mymodel.gguf HSA_GFX_VERSION=10.3.0
-#                        make run mymodel.gguf ROCM_ENV=   (disable override)
+#                        make run mymodel.gguf HSA_GFX_VERSION=   (disable)
 #
-# Detection tries:
+# Detection tries (in priority order):
 #   1. rocm-smi --showproductname  → extracts "gfxNNNN" token
 #   2. rocminfo                    → first "Name: gfxNNNN" line
-#   3. /sys/class/drm/*/device/product_name (fallback, name-based)
 
 # Step 1 – raw gfx string (e.g. "gfx1030", "gfx1100", …)
 _GFX_RAW := $(shell \
@@ -40,12 +39,12 @@ _GFX_RAW := $(shell \
 _GFX_NUM := $(shell echo '$(_GFX_RAW)' | grep -oiE '[0-9a-f]+$$')
 
 # Step 3 – leading three hex digits decide the RDNA generation
-#   gfx101x → RDNA 1 → 10.1.0
-#   gfx103x → RDNA 2 → 10.3.0
-#   gfx110x → RDNA 3 → 11.0.0
-#   gfx111x → RDNA 3 → 11.0.0
-#   gfx115x → RDNA 3.5 (APU) → 11.5.0   (treated as 11.0.0 by ROCm)
-#   gfx120x → RDNA 4 → 12.0.0
+#   gfx101x → RDNA 1   → 10.1.0
+#   gfx103x → RDNA 2   → 10.3.0
+#   gfx110x → RDNA 3   → 11.0.0
+#   gfx111x → RDNA 3   → 11.0.0
+#   gfx115x → RDNA 3.5 → 11.0.0  (APU)
+#   gfx120x → RDNA 4   → 12.0.0
 _GFX_PREFIX := $(shell echo '$(_GFX_NUM)' | cut -c1-3)
 
 # Map prefix → override version string
@@ -89,8 +88,33 @@ else
   endif
 endif
 
-# Convenience alias so the recipe can also accept ROCM_ENV=… to inject any
-# extra ROCm env vars (e.g. ROCM_ENV="--env AMD_SERIALIZE_KERNEL=3")
+# --- ROCR_VISIBLE_DEVICES (A2) ------------------------------------------------
+# Auto-select the first *discrete* GPU (index where rocm-smi reports a PCIe
+# bus address, i.e. not an integrated / CPU-embedded node).
+# Override: make run mymodel.gguf ROCR_VISIBLE_DEVICES=0
+# Disable:  make run mymodel.gguf ROCR_VISIBLE_DEVICES=
+ifndef ROCR_VISIBLE_DEVICES
+  _ROCR_IDX := $(shell \
+    if command -v rocm-smi >/dev/null 2>&1; then \
+      rocm-smi --showbus 2>/dev/null \
+        | awk '/GPU\[/{gpu=$$1} /Bus/{if($$NF ~ /^[0-9a-fA-F]{4}:/){print gpu; exit}}' \
+        | grep -oE '[0-9]+' | head -1; \
+    fi)
+  ifneq ($(_ROCR_IDX),)
+    _ROCR_ENV := --env ROCR_VISIBLE_DEVICES=$(_ROCR_IDX)
+  else
+    _ROCR_ENV :=
+  endif
+else
+  ifneq ($(ROCR_VISIBLE_DEVICES),)
+    _ROCR_ENV := --env ROCR_VISIBLE_DEVICES=$(ROCR_VISIBLE_DEVICES)
+  else
+    _ROCR_ENV :=
+  endif
+endif
+
+# Convenience alias: inject any extra ROCm env vars at run time.
+# e.g.  make run mymodel.gguf ROCM_ENV="--env AMD_SERIALIZE_KERNEL=3"
 ROCM_ENV ?=
 
 # --- Llama Server Knobs -------------------------------------------------------
@@ -98,8 +122,26 @@ ROCM_ENV ?=
 N_GPU_LAYERS  ?= 99
 # Context window (tokens)
 N_CTX         ?= 4096
-# CPU threads — leave 2-4 cores free for the OS (e.g. 8-core Ryzen 7735HS → 6)
-THREADS       ?= 6
+
+# CPU threads (D1) — auto-detect: leave 2 cores free for the OS.
+# Override: make run mymodel.gguf THREADS=8
+THREADS ?= $(shell nproc 2>/dev/null | awk '{n=$$1-2; print (n<1)?1:n}')
+
+# Flash Attention (B2) — halves KV-cache VRAM; safe to leave on for RDNA 2+.
+# Disable: make run mymodel.gguf FLASH_ATTN=0
+FLASH_ATTN ?= 1
+
+# KV cache quantization (B3) — store K and V tensors in q8_0 instead of f16.
+# Halves KV VRAM with negligible quality impact.
+# Set to f16 to disable: make run mymodel.gguf KV_CACHE_TYPE=f16
+KV_CACHE_TYPE ?= q8_0
+
+# Build flash-attention and KV-cache flags
+_FA_FLAG :=
+ifeq ($(FLASH_ATTN),1)
+  _FA_FLAG := -fa
+endif
+_KV_FLAGS := --cache-type-k $(KV_CACHE_TYPE) --cache-type-v $(KV_CACHE_TYPE)
 
 # --- Logging ------------------------------------------------------------------
 ENABLE_FILE_LOGGING ?= false
@@ -107,7 +149,13 @@ LOG_DIR             ?= $(CURDIR)/llama-logs
 
 # --- Server arguments ---------------------------------------------------------
 # Override the whole string if you need full control; otherwise tune the vars above.
-EXTRA_ARGS ?= --host 0.0.0.0 -ngl $(N_GPU_LAYERS) -c $(N_CTX) -t $(THREADS)
+EXTRA_ARGS ?= --host 0.0.0.0 -ngl $(N_GPU_LAYERS) -c $(N_CTX) -t $(THREADS) $(_FA_FLAG) $(_KV_FLAGS)
+
+# --- Container hardening flags (E1, E3) ---------------------------------------
+# --security-opt seccomp=unconfined  lets ROCm make privileged syscalls that
+#   the default seccomp profile blocks (fixes mysterious ROCm crashes).
+# --ulimit memlock=-1                allows ROCm to lock GPU buffers in RAM.
+_CONTAINER_OPTS := --security-opt seccomp=unconfined --ulimit memlock=-1
 
 # =============================================================================
 # Argument parsing
@@ -128,7 +176,7 @@ endif
 MODEL_FILE := $(or $(_RUN_ARGS),$(MODEL))
 
 # =============================================================================
-.PHONY: run download stop logs status check pull help gpu-info
+.PHONY: run download stop logs status check pull help gpu-info gpu-watch
 
 # -----------------------------------------------------------------------------
 run: stop
@@ -145,16 +193,21 @@ run: stop
 	@if [ -n "$(_HSA_ENV)" ]; then \
 	  echo "⚙️   ROCm env: $(_HSA_ENV)"; \
 	fi
+	@if [ -n "$(_ROCR_ENV)" ]; then \
+	  echo "⚙️   GPU selector: $(_ROCR_ENV)"; \
+	fi
 	@echo "🚀  Starting $(CONTAINER_NAME) [$(ENGINE)] → model: $(MODEL_FILE)"
 	@if [ "$(ENABLE_FILE_LOGGING)" = "true" ]; then \
 	  mkdir -p "$(LOG_DIR)"; \
 	  $(ENGINE) run -d \
 	    --name $(CONTAINER_NAME) \
 	    -p $(PORT):8080 \
-	    -v "$(MODELS_DIR):/models" \
+	    -v "$(MODELS_DIR):/models:ro" \
 	    -v "$(LOG_DIR):/logs" \
 	    $(DEVICES) \
+	    $(_CONTAINER_OPTS) \
 	    $(_HSA_ENV) \
+	    $(_ROCR_ENV) \
 	    $(ROCM_ENV) \
 	    --entrypoint /bin/sh \
 	    $(IMAGE) \
@@ -164,9 +217,11 @@ run: stop
 	  $(ENGINE) run -d \
 	    --name $(CONTAINER_NAME) \
 	    -p $(PORT):8080 \
-	    -v "$(MODELS_DIR):/models" \
+	    -v "$(MODELS_DIR):/models:ro" \
 	    $(DEVICES) \
+	    $(_CONTAINER_OPTS) \
 	    $(_HSA_ENV) \
+	    $(_ROCR_ENV) \
 	    $(ROCM_ENV) \
 	    $(IMAGE) \
 	    -m "/models/$(MODEL_FILE)" $(EXTRA_ARGS); \
@@ -216,21 +271,30 @@ check:
 	  || echo "❌  Server not responding on :$(PORT)"
 
 # -----------------------------------------------------------------------------
-# Show GPU detection results (useful for debugging)
+# Show GPU detection results (useful for debugging).
 gpu-info:
 	@echo ""
 	@echo "  🎮  AMD GPU Detection"
 	@echo ""
 	@if [ -n "$(_GFX_RAW)" ]; then \
-	  echo "    Raw gfx target  : $(_GFX_RAW)"; \
-	  echo "    RDNA generation : $(_RDNA_GEN)"; \
-	  echo "    HSA_OVERRIDE    : $(_HSA_OVERRIDE)"; \
-	  echo "    Container --env : $(_HSA_ENV)"; \
+	  echo "    Raw gfx target       : $(_GFX_RAW)"; \
+	  echo "    RDNA generation      : $(_RDNA_GEN)"; \
+	  echo "    HSA_OVERRIDE_GFX     : $(_HSA_OVERRIDE)"; \
+	  echo "    Container HSA --env  : $(_HSA_ENV)"; \
+	  echo "    Container ROCR --env : $(_ROCR_ENV)"; \
 	else \
 	  echo "    ⚠️  Could not detect GPU (rocm-smi / rocminfo not found or no AMD GPU)"; \
 	  echo "    Install rocm-smi or rocminfo, or set: make run MODEL=x HSA_GFX_VERSION=10.3.0"; \
 	fi
 	@echo ""
+
+# -----------------------------------------------------------------------------
+# Live GPU utilisation — tails rocm-smi stats until Ctrl-C.
+# Override GPU index:  make gpu-watch GPU_IDX=1
+GPU_IDX ?= 0
+gpu-watch:
+	@echo "📊  Watching GPU $(GPU_IDX) stats (Ctrl-C to stop) …"
+	@rocm-smi -d $(GPU_IDX) --showuse --showmemuse --showtemp --showpower --loop 1
 
 # -----------------------------------------------------------------------------
 # Pull the latest image without restarting a running server.
@@ -253,17 +317,26 @@ help:
 	@echo "    make check                           GET /health to verify readiness"
 	@echo "    make pull                            Pull the latest server image"
 	@echo "    make gpu-info                        Show detected GPU / ROCm env"
+	@echo "    make gpu-watch                       Live GPU utilisation (rocm-smi)"
 	@echo "    make help                            Show this message"
 	@echo ""
 	@echo "  DOWNLOADING MODELS"
 	@echo "    make download <repo> <file>          Via HuggingFace CLI (hf)"
 	@echo "    make download URL=<url>              Via wget / curl"
 	@echo ""
-	@echo "  ROCm GPU OVERRIDE"
+	@echo "  ROCm / GPU OVERRIDES"
 	@echo "    GPU auto-detected via rocm-smi / rocminfo (RDNA 1/2/3/4 mapped automatically)"
-	@echo "    Pin manually:  make run <model> HSA_GFX_VERSION=10.3.0"
-	@echo "    Disable:       make run <model> HSA_GFX_VERSION="
-	@echo "    Extra env:     make run <model> ROCM_ENV='--env AMD_SERIALIZE_KERNEL=3'"
+	@echo "    Pin HSA version:   make run <model> HSA_GFX_VERSION=10.3.0"
+	@echo "    Disable HSA:       make run <model> HSA_GFX_VERSION="
+	@echo "    Pin GPU index:     make run <model> ROCR_VISIBLE_DEVICES=0"
+	@echo "    Extra ROCm env:    make run <model> ROCM_ENV='--env AMD_SERIALIZE_KERNEL=3'"
+	@echo ""
+	@echo "  PERFORMANCE KNOBS  (current values)"
+	@echo "    FLASH_ATTN        = $(FLASH_ATTN)   (1=on, 0=off)"
+	@echo "    KV_CACHE_TYPE     = $(KV_CACHE_TYPE)  (q8_0 | q4_0 | f16)"
+	@echo "    N_GPU_LAYERS      = $(N_GPU_LAYERS)"
+	@echo "    N_CTX             = $(N_CTX)"
+	@echo "    THREADS           = $(THREADS)  (auto: nproc-2)"
 	@echo ""
 	@echo "  VARIABLES  (current values)"
 	@echo "    ENGINE            = $(ENGINE)"
@@ -272,15 +345,15 @@ help:
 	@echo "    PORT              = $(PORT)"
 	@echo "    MODELS_DIR        = $(MODELS_DIR)"
 	@echo "    DEVICES           = $(DEVICES)"
-	@echo "    N_GPU_LAYERS      = $(N_GPU_LAYERS)"
-	@echo "    N_CTX             = $(N_CTX)"
-	@echo "    THREADS           = $(THREADS)"
 	@echo "    ENABLE_FILE_LOGGING = $(ENABLE_FILE_LOGGING)"
 	@echo "    LOG_DIR           = $(LOG_DIR)"
 	@echo "    EXTRA_ARGS        = $(EXTRA_ARGS)"
 	@if [ -n "$(_GFX_RAW)" ]; then \
 	  echo "    GPU (detected)    = $(_GFX_RAW) ($(_RDNA_GEN))"; \
 	  echo "    HSA_OVERRIDE_GFX  = $(_HSA_OVERRIDE)  (auto)"; \
+	  if [ -n "$(_ROCR_IDX)" ]; then \
+	    echo "    ROCR_VISIBLE      = $(_ROCR_IDX)  (auto, discrete GPU)"; \
+	  fi; \
 	else \
 	  echo "    GPU (detected)    = (none — rocm-smi/rocminfo not found)"; \
 	fi
