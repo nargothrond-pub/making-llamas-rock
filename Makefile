@@ -206,7 +206,7 @@ run: stop
 	@if [ "$(ENABLE_FILE_LOGGING)" = "true" ]; then \
 	  mkdir -p "$(LOG_DIR)"; \
 	  echo "🛠️   Command being executed:"; \
-	  (set -x; $(ENGINE) run -d \
+	  (set -x; $(ENGINE) run -d --rm \
 	    --name $(CONTAINER_NAME) \
 	    -p $(PORT):8080 \
 	    -v "$(MODELS_DIR):/models:ro" \
@@ -222,7 +222,7 @@ run: stop
 	  echo "✅  Server started. Logs → $(LOG_DIR)/llama-server.log  (make logs)"; \
 	else \
 	  echo "🛠️   Command being executed:"; \
-	  (set -x; $(ENGINE) run -d \
+	  (set -x; $(ENGINE) run -d --rm \
 	    --name $(CONTAINER_NAME) \
 	    -p $(PORT):8080 \
 	    -v "$(MODELS_DIR):/models:ro" \
