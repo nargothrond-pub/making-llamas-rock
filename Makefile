@@ -139,11 +139,13 @@ KV_CACHE_TYPE ?= q8_0
 # Build flash-attention and KV-cache flags
 # Use the long form "--flash-attn on" — bare "-fa" accepts an optional value
 # so the parser would greedily consume the next flag (--cache-type-k) as it.
-_FA_FLAG :=
+_FA_FLAG := --flash-attn off
+_KV_FLAGS := --cache-type-k $(KV_CACHE_TYPE) --cache-type-v f16
 ifeq ($(FLASH_ATTN),1)
   _FA_FLAG := --flash-attn on
+  # V-cache quantization strictly requires Flash Attention in llama.cpp
+  _KV_FLAGS := --cache-type-k $(KV_CACHE_TYPE) --cache-type-v $(KV_CACHE_TYPE)
 endif
-_KV_FLAGS := --cache-type-k $(KV_CACHE_TYPE) --cache-type-v $(KV_CACHE_TYPE)
 
 # --- Logging ------------------------------------------------------------------
 ENABLE_FILE_LOGGING ?= false
