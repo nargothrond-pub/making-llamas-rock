@@ -203,7 +203,8 @@ run: stop
 	@echo "🚀  Starting $(CONTAINER_NAME) [$(ENGINE)] → model: $(MODEL_FILE)"
 	@if [ "$(ENABLE_FILE_LOGGING)" = "true" ]; then \
 	  mkdir -p "$(LOG_DIR)"; \
-	  $(ENGINE) run -d \
+	  echo "🛠️   Command being executed:"; \
+	  (set -x; $(ENGINE) run -d \
 	    --name $(CONTAINER_NAME) \
 	    -p $(PORT):8080 \
 	    -v "$(MODELS_DIR):/models:ro" \
@@ -215,10 +216,11 @@ run: stop
 	    $(ROCM_ENV) \
 	    --entrypoint /bin/sh \
 	    $(IMAGE) \
-	    -c '/app/llama-server -m "/models/$(MODEL_FILE)" $(EXTRA_ARGS) 2>&1 | tee /logs/llama-server.log'; \
+	    -c '/app/llama-server -m "/models/$(MODEL_FILE)" $(EXTRA_ARGS) 2>&1 | tee /logs/llama-server.log'); \
 	  echo "✅  Server started. Logs → $(LOG_DIR)/llama-server.log  (make logs)"; \
 	else \
-	  $(ENGINE) run -d \
+	  echo "🛠️   Command being executed:"; \
+	  (set -x; $(ENGINE) run -d \
 	    --name $(CONTAINER_NAME) \
 	    -p $(PORT):8080 \
 	    -v "$(MODELS_DIR):/models:ro" \
@@ -228,7 +230,7 @@ run: stop
 	    $(_ROCR_ENV) \
 	    $(ROCM_ENV) \
 	    $(IMAGE) \
-	    -m "/models/$(MODEL_FILE)" $(EXTRA_ARGS); \
+	    -m "/models/$(MODEL_FILE)" $(EXTRA_ARGS)); \
 	  echo "✅  Server started on :$(PORT)  (make logs | make check)"; \
 	fi
 
