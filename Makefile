@@ -137,9 +137,11 @@ FLASH_ATTN ?= 1
 KV_CACHE_TYPE ?= q8_0
 
 # Build flash-attention and KV-cache flags
+# Use the long form "--flash-attn on" — bare "-fa" accepts an optional value
+# so the parser would greedily consume the next flag (--cache-type-k) as it.
 _FA_FLAG :=
 ifeq ($(FLASH_ATTN),1)
-  _FA_FLAG := -fa
+  _FA_FLAG := --flash-attn on
 endif
 _KV_FLAGS := --cache-type-k $(KV_CACHE_TYPE) --cache-type-v $(KV_CACHE_TYPE)
 
@@ -149,7 +151,9 @@ LOG_DIR             ?= $(CURDIR)/llama-logs
 
 # --- Server arguments ---------------------------------------------------------
 # Override the whole string if you need full control; otherwise tune the vars above.
-EXTRA_ARGS ?= --host 0.0.0.0 -ngl $(N_GPU_LAYERS) -c $(N_CTX) -t $(THREADS) $(_FA_FLAG) $(_KV_FLAGS)
+# Note: --host is intentionally omitted here; the image sets LLAMA_ARG_HOST=0.0.0.0
+# by default. Adding --host would only produce a harmless warning.
+EXTRA_ARGS ?= -ngl $(N_GPU_LAYERS) -c $(N_CTX) -t $(THREADS) $(_FA_FLAG) $(_KV_FLAGS)
 
 # --- Container hardening flags (E1, E3) ---------------------------------------
 # --security-opt seccomp=unconfined  lets ROCm make privileged syscalls that
