@@ -13,41 +13,32 @@ ENGINE        ?= podman
 # Default: AMD ROCm. Nvidia override example: DEVICES="--gpus all"
 DEVICES       ?= --device /dev/kfd --device /dev/dri
 
-# --- GPU auto-detection -------------------------------------------------------
+# --- AMD GPU auto-detection -------------------------------------------------------
 # Detect the AMD GPU gfx target from the host using rocm-smi or rocminfo,
 # then map it to the RDNA family and set the HSA_OVERRIDE_GFX_VERSION that
 # ROCm needs for unsupported consumer GPUs.
 #
 # Override at any time:  make run mymodel.gguf HSA_GFX_VERSION=10.3.0
-#                        make run mymodel.gguf HSA_GFX_VERSION=   (disable)
-#
-# Detection tries (in priority order):
-#   1. rocm-smi --showproductname  → extracts "gfxNNNN" token
-#   2. rocminfo                    → first "Name: gfxNNNN" line
 
-# Step 1 – raw gfx string (e.g. "gfx1030", "gfx1100", …)
-_GFX_RAW := $(shell \
-  if command -v rocm-smi >/dev/null 2>&1; then \
-    rocm-smi --showproductname 2>/dev/null \
-      | grep -oiE 'gfx[0-9a-f]+' | head -1; \
-  elif command -v rocminfo >/dev/null 2>&1; then \
-    rocminfo 2>/dev/null \
-      | grep -m1 -oiE 'gfx[0-9a-f]+' | head -1; \
-  fi)
+# 1. Try sysfs first (works even if rocm-smi is not installed on the host)
+_SYSFS_GFX := $(shell cat /sys/class/kfd/kfd/topology/nodes/*/properties 2>/dev/null | awk '/gfx_target_version/ && $$2 != 0 {print $$2}' | head -n 1)
+ifneq ($(_SYSFS_GFX),)
+  _GFX_NUM := $(shell echo $(_SYSFS_GFX) | sed -E 's/0([0-9])/\1/g')
+else
+  # 2. Fallback to rocm-smi or rocminfo
+  _GFX_RAW := $(shell \
+    if command -v rocm-smi >/dev/null 2>&1; then \
+      rocm-smi --showproductname 2>/dev/null | grep -oiE 'gfx[0-9a-f]+' | head -1; \
+    elif command -v rocminfo >/dev/null 2>&1; then \
+      rocminfo 2>/dev/null | grep -m1 -oiE 'gfx[0-9a-f]+' | head -1; \
+    fi)
+  _GFX_NUM := $(shell echo '$(_GFX_RAW)' | grep -oiE '[0-9a-f]+$$')
+endif
 
-# Step 2 – numeric part only (e.g. "1030", "1100")
-_GFX_NUM := $(shell echo '$(_GFX_RAW)' | grep -oiE '[0-9a-f]+$$')
-
-# Step 3 – leading three hex digits decide the RDNA generation
-#   gfx101x → RDNA 1   → 10.1.0
-#   gfx103x → RDNA 2   → 10.3.0
-#   gfx110x → RDNA 3   → 11.0.0
-#   gfx111x → RDNA 3   → 11.0.0
-#   gfx115x → RDNA 3.5 → 11.0.0  (APU)
-#   gfx120x → RDNA 4   → 12.0.0
+# Extract prefix
 _GFX_PREFIX := $(shell echo '$(_GFX_NUM)' | cut -c1-3)
 
-# Map prefix → override version string
+# Map prefix -> override version
 ifeq ($(_GFX_PREFIX),101)
   _RDNA_GEN     := RDNA 1
   _HSA_OVERRIDE := 10.1.0
